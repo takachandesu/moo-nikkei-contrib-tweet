@@ -1,9 +1,30 @@
+# =============================================================
+# 日経225寄与度ランキング → X 自動配信ワークフロー
+#
+# このワークフローは FTP を一切使いません。
+# - データ取得: Playwright で moo-stock-blog.com を読むだけ (HTTPS)
+# - state保存: data/last_state.json を本リポジトリ内に git push
+# - 投稿:      X API (HTTPS)
+# 
+# したがって moo-adr-tracker / moo-growth250-tracker が使う
+# ロリポップFTP の state-name (.ftp-deploy-adr.json,
+# .ftp-deploy-growth250.json) とは衝突しません。
+#
+# 将来この仕組みに FTP アップロードを追加する場合は、
+# 引継ぎメモ §3 のルールに従って固有の state-name を指定すること。
+#   例: state-name: .ftp-deploy-nikkei-contrib.json
+# =============================================================
+
 name: Post Nikkei Contribution to X
 
 on:
   schedule:
-    - cron: '0 7 * * 1-5'
+    # JST 9:00 - 16:30 を 30分おき (= UTC 0:00 - 7:30) 平日
+    - cron: '0,30 0-7 * * 1-5'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: post-nikkei-contrib-to-x
@@ -13,19 +34,23 @@ jobs:
   post:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
+
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}-v1
+
       - name: Install dependencies
         run: |
           pip install --quiet tweepy playwright
@@ -34,11 +59,24 @@ jobs:
           else
             playwright install --with-deps chromium
           fi
+
       - name: Post to X
         env:
-          DRY_RUN: "1"
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
         run: python scripts/post_nikkei_contrib_to_x.py
+
+      - name: Commit state if changed
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/last_state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "Update last_state [skip ci]"
+            git push
+          fi
