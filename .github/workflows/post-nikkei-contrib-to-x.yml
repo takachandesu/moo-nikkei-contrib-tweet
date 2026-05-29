@@ -1,49 +1,44 @@
 name: Post Nikkei Contribution to X
-   
-   on:
-     schedule:
-       - cron: '0 7 * * 1-5'   # JST 16:00 月～金（大引け+データ反映遅延を見て）
-     workflow_dispatch:
-   
-   concurrency:
-     group: post-nikkei-contrib-to-x
-     cancel-in-progress: false
-   
-   jobs:
-     post:
-       runs-on: ubuntu-latest
-       timeout-minutes: 8
-   
-       steps:
-         - name: Checkout repository
-           uses: actions/checkout@v4
-   
-         - name: Set up Python
-           uses: actions/setup-python@v5
-           with:
-             python-version: '3.11'
-             cache: pip
-   
-         - name: Cache Playwright browsers
-           uses: actions/cache@v4
-           with:
-             path: ~/.cache/ms-playwright
-             key: playwright-chromium-${{ runner.os }}-v1
-   
-         - name: Install dependencies
-           run: |
-             pip install --quiet tweepy playwright
-             if ls "$HOME/.cache/ms-playwright/" 2>/dev/null | grep -q chromium; then
-               playwright install-deps chromium || true
-             else
-               playwright install --with-deps chromium
-             fi
-   
-         - name: Post to X
-           env:
-             DRY_RUN: "1"
-             X_API_KEY: ${{ secrets.X_API_KEY }}
-             X_API_SECRET: ${{ secrets.X_API_SECRET }}
-             X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
-             X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
-           run: python scripts/post_nikkei_contrib_to_x.py
+
+on:
+  schedule:
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: post-nikkei-contrib-to-x
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+      - name: Install dependencies
+        run: |
+          pip install --quiet tweepy playwright
+          if ls "$HOME/.cache/ms-playwright/" 2>/dev/null | grep -q chromium; then
+            playwright install-deps chromium || true
+          else
+            playwright install --with-deps chromium
+          fi
+      - name: Post to X
+        env:
+          DRY_RUN: "1"
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+        run: python scripts/post_nikkei_contrib_to_x.py
