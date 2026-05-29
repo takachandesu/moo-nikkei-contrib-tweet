@@ -1,25 +1,26 @@
 """
-日経225寄与度ランキングを毎日大引け後にXに投稿するスクリプト。
+日経225寄与度ランキングをページ更新後に自動配信するスクリプト。
 moo-stock-blog.com の寄与度ページをPlaywrightで開き、
-ベスト4・ワースト4を1ツイートで投稿。X の280文字制限に応じて自動で
-4位→3位、騰落率なしへとフォールバック。
-ページ上の「最終更新 HH:MM」表示も拾ってツイート文に入れる。
+前回保存した state と比較して、ベスト4 / ワースト4 の構成銘柄に
+変化があった時だけX投稿する。
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import tweepy
 from playwright.sync_api import sync_playwright
 
 JST = timezone(timedelta(hours=9))
 PAGE_URL = "https://moo-stock-blog.com/%e6%97%a5%e7%b5%8c225%e5%af%84%e4%b8%8e%e5%ba%a6/"
-TWEET_LIMIT = 280  # X の文字数上限（重み付き）
+STATE_FILE = Path("data/last_state.json")
+TWEET_LIMIT = 280
 
-# ページ側で既に短縮されてるが、念のため辞書（ADR版から流用）
 NAME_SHORT = {
     "ファーストリテイリング": "ファストリ",
     "東京エレクトロン": "東エレク",
@@ -43,7 +44,6 @@ def parse_yen(text: str) -> float:
 
 
 def weighted_len(s: str) -> int:
-    """X の文字カウント概算（ASCII=1, それ以外=2）。安全側に多めに数える。"""
     return sum(1 if ord(c) < 0x80 else 2 for c in s)
 
 
@@ -82,7 +82,6 @@ def extract_rankings(page) -> dict:
     if len(best) < 4 or len(worst) < 4:
         raise RuntimeError(f"ランキング取得不足 best={len(best)} worst={len(worst)}")
 
-    # ページ上の「最終更新 HH:MM」表示を取得
     update_time = ""
     try:
         raw = (page.locator(".imp-ranks-time[data-update-time]")
@@ -113,11 +112,11 @@ def _build(data: dict, top_n: int, include_pct: bool) -> str:
             return f"{nm} {s['yen_text']} ({s['pct_text']})"
         return f"{nm} {s['yen_text']}"
 
-    lines.append(f"🟢 ベスト{top_n}（押し上げ）")
+    lines.append(f"🟢 ベスト{top_n}(押し上げ)")
     for i, s in enumerate(data["best"][:top_n], 1):
         lines.append(f"{i}. {fmt(s)}")
     lines.append("")
-    lines.append(f"🔴 ワースト{top_n}（押し下げ）")
+    lines.append(f"🔴 ワースト{top_n}(押し下げ)")
     for i, s in enumerate(data["worst"][:top_n], 1):
         lines.append(f"{i}. {fmt(s)}")
     lines.append("")
@@ -126,19 +125,14 @@ def _build(data: dict, top_n: int, include_pct: bool) -> str:
 
 
 def build_tweet(data: dict) -> str:
-    """ユーザ希望: 4位優先、入らなければ3位までで妥協。さらに入らなければ騰落率削除。"""
     candidates = [
-        (4, True),   # 4位+騰落率 ← 第一希望
-        (4, False),  # 4位のみ
-        (3, True),   # 3位+騰落率 ← 第二希望
-        (3, False),  # 3位のみ ← 最終フォールバック
+        (4, True), (4, False), (3, True), (3, False),
     ]
     for top_n, pct in candidates:
         t = _build(data, top_n, pct)
         if weighted_len(t) <= TWEET_LIMIT:
             print(f"[info] 採用: top_n={top_n} pct={pct} len={weighted_len(t)}")
             return t
-    # ここに来るのは異常時のみ
     return _build(data, 3, False)
 
 
@@ -150,6 +144,51 @@ def post_tweet(text: str):
         access_token_secret=os.environ["X_ACCESS_SECRET"],
     )
     client.create_tweet(text=text)
+
+
+def composition_changed(new_data: dict, old_state: dict | None) -> bool:
+    """ベスト4 / ワースト4 の構成銘柄(code集合)に変化があるか"""
+    if old_state is None:
+        return True
+
+    def codes(items):
+        return {r["code"] for r in items[:4]}
+
+    new_best = codes(new_data["best"])
+    new_worst = codes(new_data["worst"])
+    old_best = codes(old_state.get("best", []))
+    old_worst = codes(old_state.get("worst", []))
+
+    if new_best != old_best:
+        print(f"[info] ベスト構成変化を検出: {new_best ^ old_best}")
+        return True
+    if new_worst != old_worst:
+        print(f"[info] ワースト構成変化を検出: {new_worst ^ old_worst}")
+        return True
+    return False
+
+
+def load_state() -> dict | None:
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[warn] state読み込み失敗 (新規扱い): {e}", file=sys.stderr)
+        return None
+
+
+def save_state(data: dict):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "best": data["best"][:4],
+        "worst": data["worst"][:4],
+        "saved_at": datetime.now(JST).isoformat(),
+    }
+    STATE_FILE.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
@@ -171,22 +210,30 @@ def main() -> int:
         print(f"[error] 取得失敗: {e}", file=sys.stderr)
         return 1
 
+    old_state = load_state()
+    if not composition_changed(data, old_state):
+        print("[info] 構成変化なし → 投稿スキップ")
+        return 0
+
     text = build_tweet(data)
     print("--- TWEET PREVIEW ---")
     print(text)
     print(f"--- ({weighted_len(text)} weighted chars) ---")
 
     if os.environ.get("DRY_RUN") == "1":
-        print("[DRY_RUN=1] 投稿スキップ")
+        print("[DRY_RUN=1] 投稿スキップ(state も更新しない)")
         return 0
 
     try:
         post_tweet(text)
         print("✅ Posted")
-        return 0
     except Exception as e:
-        print(f"[error] 投稿失敗: {e}", file=sys.stderr)
+        print(f"[error] 投稿失敗 (state は更新しない): {e}", file=sys.stderr)
         return 2
+
+    save_state(data)
+    print(f"[info] state を保存: {STATE_FILE}")
+    return 0
 
 
 if __name__ == "__main__":
