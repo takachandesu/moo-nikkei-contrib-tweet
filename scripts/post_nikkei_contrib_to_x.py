@@ -3,6 +3,11 @@
 moo-stock-blog.com の寄与度ページをPlaywrightで開き、
 前回保存した state と比較して、ベスト4 / ワースト4 の構成銘柄に
 変化があった時だけX投稿する。
+
+ツイート仕様:
+- 数値は小数点1桁(第2位四捨五入)
+- URL を末尾に貼る(X側でt.co短縮: 23文字扱い)
+- 4位優先、文字数オーバーなら3位にフォールバック
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ from playwright.sync_api import sync_playwright
 
 JST = timezone(timedelta(hours=9))
 PAGE_URL = "https://moo-stock-blog.com/%e6%97%a5%e7%b5%8c225%e5%af%84%e4%b8%8e%e5%ba%a6/"
+PUBLIC_URL = "https://moo-stock-blog.com/日経225寄与度/"   # ツイート末尾用(短縮形)
 STATE_FILE = Path("data/last_state.json")
 TWEET_LIMIT = 280
 
@@ -43,8 +49,35 @@ def parse_yen(text: str) -> float:
     return -val if sign == "-" else val
 
 
+def parse_pct(text: str) -> float | None:
+    """'+10.91%' → 10.91"""
+    m = re.search(r"([+-]?)\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if not m:
+        return None
+    sign, num = m.groups()
+    val = float(num)
+    return -val if sign == "-" else val
+
+
+URL_RE = re.compile(r"https?://\S+")
+
+
 def weighted_len(s: str) -> int:
-    return sum(1 if ord(c) < 0x80 else 2 for c in s)
+    """X の文字カウント: URL=23(t.co短縮), CJK等=2, ASCII=1"""
+    counted = URL_RE.sub("X" * 23, s)
+    return sum(1 if ord(c) < 0x80 else 2 for c in counted)
+
+
+def fmt_yen_1dec(yen_value: float) -> str:
+    """+¥215.0 / -¥54.7 形式 (小数点1桁)"""
+    sign = "+" if yen_value >= 0 else "-"
+    return f"{sign}¥{abs(yen_value):.1f}"
+
+
+def fmt_pct_1dec(pct_value: float) -> str:
+    """+10.9% / -2.4% 形式 (小数点1桁)"""
+    sign = "+" if pct_value >= 0 else "-"
+    return f"{sign}{abs(pct_value):.1f}%"
 
 
 def extract_rankings(page) -> dict:
@@ -74,6 +107,7 @@ def extract_rankings(page) -> dict:
                 "yen": parse_yen(yen_txt),
                 "yen_text": yen_txt,
                 "pct_text": pct_txt,
+                "pct_value": parse_pct(pct_txt),
             })
         return items
 
@@ -99,18 +133,23 @@ def short_name(name: str) -> str:
     return NAME_SHORT.get(name, name)
 
 
-def _build(data: dict, top_n: int, include_pct: bool) -> str:
+def _build(data: dict, top_n: int, include_pct: bool, include_ts: bool) -> str:
     now = datetime.now(JST)
     date_str = f"{now.month}/{now.day}"
-    ut = data.get("update_time", "")
-    suffix = f" / 更新 {ut}" if ut else ""
+    if include_ts:
+        ut = data.get("update_time", "")
+        suffix = f" / 更新 {ut}" if ut else ""
+    else:
+        suffix = ""
     lines = [f"📊 日経225 寄与度ランキング ({date_str}{suffix})", ""]
 
     def fmt(s):
         nm = short_name(s["name"])
-        if include_pct and s["pct_text"]:
-            return f"{nm} {s['yen_text']} ({s['pct_text']})"
-        return f"{nm} {s['yen_text']}"
+        yen_str = fmt_yen_1dec(s["yen"])
+        if include_pct and s["pct_value"] is not None:
+            pct_str = fmt_pct_1dec(s["pct_value"])
+            return f"{nm} {yen_str} ({pct_str})"
+        return f"{nm} {yen_str}"
 
     lines.append(f"🟢 ベスト{top_n}(押し上げ)")
     for i, s in enumerate(data["best"][:top_n], 1):
@@ -121,19 +160,32 @@ def _build(data: dict, top_n: int, include_pct: bool) -> str:
         lines.append(f"{i}. {fmt(s)}")
     lines.append("")
     lines.append("#日経平均 #日経225 #寄与度")
+    lines.append(PUBLIC_URL)   # ← URL は最後
     return "\n".join(lines)
 
 
 def build_tweet(data: dict) -> str:
+    """4位優先で情報多い順に試し、入らなければ落としていく"""
     candidates = [
-        (4, True), (4, False), (3, True), (3, False),
+        # (top_n, include_pct, include_ts)
+        (4, True, True),     # 4位+騰落率+更新時刻
+        (4, True, False),    # 4位+騰落率
+        (4, False, True),    # 4位+更新時刻
+        (4, False, False),   # 4位のみ
+        (3, True, True),     # 3位+全情報
+        (3, True, False),
+        (3, False, True),
+        (3, False, False),
     ]
-    for top_n, pct in candidates:
-        t = _build(data, top_n, pct)
-        if weighted_len(t) <= TWEET_LIMIT:
-            print(f"[info] 採用: top_n={top_n} pct={pct} len={weighted_len(t)}")
+    for top_n, pct, ts in candidates:
+        t = _build(data, top_n, pct, ts)
+        L = weighted_len(t)
+        if L <= TWEET_LIMIT:
+            print(f"[info] 採用: top_n={top_n} pct={pct} ts={ts} len={L}")
             return t
-    return _build(data, 3, False)
+        else:
+            print(f"[info] スキップ: top_n={top_n} pct={pct} ts={ts} len={L} (上限超え)")
+    return _build(data, 3, False, False)
 
 
 def post_tweet(text: str):
@@ -147,7 +199,6 @@ def post_tweet(text: str):
 
 
 def composition_changed(new_data: dict, old_state: dict | None) -> bool:
-    """ベスト4 / ワースト4 の構成銘柄(code集合)に変化があるか"""
     if old_state is None:
         return True
 
