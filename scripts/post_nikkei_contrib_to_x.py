@@ -199,23 +199,52 @@ def post_tweet(text: str):
 
 
 def composition_changed(new_data: dict, old_state: dict | None) -> bool:
+    """変化検知: 以下のいずれかで「変化あり」と判定
+    (a) ベスト4/ワースト4 の銘柄構成が入れ替わった
+    (b) 銘柄は同じでも順位が変わった
+    (c) いずれかの銘柄で寄与額が ±20% 以上動いた
+    """
     if old_state is None:
         return True
 
-    def codes(items):
-        return {r["code"] for r in items[:4]}
+    YEN_DELTA_RATIO = 0.20   # 寄与額が ±20% 以上動いたら変化扱い
 
-    new_best = codes(new_data["best"])
-    new_worst = codes(new_data["worst"])
-    old_best = codes(old_state.get("best", []))
-    old_worst = codes(old_state.get("worst", []))
+    def codes_order(items):
+        return [r["code"] for r in items[:4]]
 
-    if new_best != old_best:
-        print(f"[info] ベスト構成変化を検出: {new_best ^ old_best}")
-        return True
-    if new_worst != old_worst:
-        print(f"[info] ワースト構成変化を検出: {new_worst ^ old_worst}")
-        return True
+    def yen_by_code(items):
+        return {r["code"]: r.get("yen", 0.0) for r in items[:4]}
+
+    for side in ("best", "worst"):
+        new_order = codes_order(new_data[side])
+        old_order = codes_order(old_state.get(side, []))
+
+        # (a) 構成変化: 銘柄コードの集合が違う
+        if set(new_order) != set(old_order):
+            print(f"[info] {side} 構成変化: {set(new_order) ^ set(old_order)}")
+            return True
+
+        # (b) 順位変化: 銘柄は同じだが順位が違う
+        if new_order != old_order:
+            print(f"[info] {side} 順位変化: 旧={old_order} 新={new_order}")
+            return True
+
+        # (c) 寄与額の大きな変化
+        new_yen = yen_by_code(new_data[side])
+        old_yen = yen_by_code(old_state.get(side, []))
+        for code, ny in new_yen.items():
+            oy = old_yen.get(code, 0.0)
+            if abs(oy) < 1.0:
+                # 旧値がほぼ0なら新値が1円超で変化扱い
+                if abs(ny) >= 1.0:
+                    print(f"[info] {side} {code} 寄与額変化(旧≈0): {oy:.1f} → {ny:.1f}")
+                    return True
+                continue
+            ratio = abs(ny - oy) / abs(oy)
+            if ratio >= YEN_DELTA_RATIO:
+                print(f"[info] {side} {code} 寄与額±{YEN_DELTA_RATIO*100:.0f}%超: {oy:.1f} → {ny:.1f} ({ratio*100:.0f}%)")
+                return True
+
     return False
 
 
