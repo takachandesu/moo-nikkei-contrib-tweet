@@ -32,7 +32,7 @@ import tweepy
 # ============================================================
 JST = timezone(timedelta(hours=9))
 PROXY_URL = "https://moo-stock-blog.com/stock-proxy.php"
-PUBLIC_URL = "https://moo-stock-blog.com/日経225寄与度/"
+PUBLIC_URL = "https://moo-stock-blog.com/%e6%97%a5%e7%b5%8c225%e5%af%84%e4%b8%8e%e5%ba%a6/"
 DIVISOR = 30.0      # 日経の除数(ダイビザー)
 PARALLEL = 15       # Yahoo並列取得数
 TIMEOUT = 8         # 1リクエストあたりのタイムアウト(秒)
