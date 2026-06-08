@@ -81,10 +81,21 @@ def fmt_pct_1dec(pct_value: float) -> str:
 
 
 def extract_rankings(page) -> dict:
+    # ページのJS処理が終わるまで待つ:
+    #  - ランキング行が4位まで揃ってる
+    #  - かつ「最終更新 HH:MM」がプレースホルダ「―」から実時刻に置き換わってる
+    # Yahoo Financeは1銘柄/req のため遅め → 120秒待ちに設定
     page.wait_for_function(
-        "document.querySelectorAll('.imp-rank-col.up .imp-rank-row').length >= 4 "
-        "&& document.querySelectorAll('.imp-rank-col.down .imp-rank-row').length >= 4",
-        timeout=45000,
+        """() => {
+            const best = document.querySelectorAll('.imp-rank-col.up .imp-rank-row').length;
+            const worst = document.querySelectorAll('.imp-rank-col.down .imp-rank-row').length;
+            if (best < 4 || worst < 4) return false;
+            const t = document.querySelector('.imp-ranks-time[data-update-time]');
+            if (t && /\\d{1,2}:\\d{2}/.test(t.textContent || '')) return true;
+            // 時刻表示がまだ無くてもランキングが揃っていればOK (後方互換)
+            return true;
+        }""",
+        timeout=120000,
     )
 
     def grab(side_class: str) -> list[dict]:
