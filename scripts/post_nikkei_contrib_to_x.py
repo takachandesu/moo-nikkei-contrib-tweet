@@ -3,7 +3,7 @@
 
 仕組み:
 1. 内蔵された225銘柄リスト (code, name, PAF) を使用
-2. Yahoo Finance Chart API を stock-proxy.php 経由で並列15で取得
+2. Yahoo Finance Chart API を直接・並列8で取得 (プロキシ不使用 / リトライ+再試行ラウンド付き)
 3. 寄与額を計算: (close - prev) × PAF / 30
 4. ベスト4/ワースト4 を抽出 → 前回 state と比較 → 変化があればX投稿
 
@@ -19,7 +19,6 @@ import json
 import os
 import re
 import sys
-import urllib.parse
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -31,13 +30,27 @@ import tweepy
 #  設定
 # ============================================================
 JST = timezone(timedelta(hours=9))
-PROXY_URL = "https://moo-stock-blog.com/stock-proxy.php"
 PUBLIC_URL = "https://moo-stock-blog.com/%e6%97%a5%e7%b5%8c225%e5%af%84%e4%b8%8e%e5%ba%a6/"
 DIVISOR = 30.0      # 日経の除数(ダイビザー)
-PARALLEL = 15       # Yahoo並列取得数
-TIMEOUT = 8         # 1リクエストあたりのタイムアウト(秒)
+PARALLEL = 8        # Yahoo並列取得数 (絞ってレート制限を回避)
+TIMEOUT = 10        # 1リクエストあたりのタイムアウト(秒)
+RETRIES = 3         # 銘柄ごとのリトライ回数
+ROUNDS = 2          # 全体の再試行ラウンド数
+MIN_GOT = 180       # 最低取得銘柄数 (225中)
 STATE_FILE = Path("data/last_state.json")
 TWEET_LIMIT = 280
+
+# Yahoo Finance を直接叩く (GitHub ActionsはCORS制約なし、プロキシ不要)
+YAHOO_HOSTS = [
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com",
+]
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json",
+}
 
 NAME_SHORT = {
     "ファーストリテイリング": "ファストリ",
@@ -311,37 +324,56 @@ def short_name(name: str) -> str:
 #  Yahoo Finance 取得 (並列)
 # ============================================================
 def fetch_yahoo(code: str) -> tuple[float, float] | None:
-    """1銘柄の (close, prev) を Yahoo から取得。失敗時 None。"""
-    yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.T"
-    proxy_url = f"{PROXY_URL}?url={urllib.parse.quote(yahoo_url, safe='')}"
-    try:
-        r = requests.get(proxy_url, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        result = j.get("chart", {}).get("result", [])
-        if not result:
-            return None
-        meta = result[0].get("meta", {})
-        close = meta.get("regularMarketPrice")
-        prev = meta.get("chartPreviousClose")
-        if not isinstance(close, (int, float)) or not isinstance(prev, (int, float)) or prev <= 0:
-            return None
-        return (float(close), float(prev))
-    except Exception:
-        return None
+    """1銘柄の (close, prev) を Yahoo から直接取得。
+    query1 → query2 フォールバック、429はバックオフ、最大 RETRIES 回。"""
+    import time, random
+    for attempt in range(RETRIES):
+        host = YAHOO_HOSTS[attempt % len(YAHOO_HOSTS)]
+        url = f"{host}/v8/finance/chart/{code}.T"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 429:
+                # レート制限: 待ってリトライ
+                time.sleep(2.0 + attempt * 2.0 + random.random())
+                continue
+            if r.status_code != 200:
+                time.sleep(0.5 + random.random() * 0.5)
+                continue
+            j = r.json()
+            result = j.get("chart", {}).get("result", [])
+            if not result:
+                return None
+            meta = result[0].get("meta", {})
+            close = meta.get("regularMarketPrice")
+            prev = meta.get("chartPreviousClose")
+            if not isinstance(close, (int, float)) or not isinstance(prev, (int, float)) or prev <= 0:
+                return None
+            return (float(close), float(prev))
+        except Exception:
+            time.sleep(0.5 + random.random() * 0.5)
+            continue
+    return None
 
 
 def fetch_all_prices() -> dict[str, tuple[float, float]]:
-    """全225銘柄を並列取得。{code: (close, prev)} を返す。"""
+    """全225銘柄を並列取得。取得不足なら全体を再試行 (最大 ROUNDS ラウンド)。"""
+    import time
     results: dict[str, tuple[float, float]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL) as ex:
-        future_to_code = {ex.submit(fetch_yahoo, code): code for code, _, _ in STOCKS}
-        for f in concurrent.futures.as_completed(future_to_code):
-            code = future_to_code[f]
-            data = f.result()
-            if data is not None:
-                results[code] = data
+    for round_no in range(1, ROUNDS + 1):
+        missing = [code for code, _, _ in STOCKS if code not in results]
+        if not missing:
+            break
+        if round_no > 1:
+            print(f"[info] ラウンド{round_no}: 未取得 {len(missing)}銘柄を再試行 (30秒待機)")
+            time.sleep(30)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL) as ex:
+            future_to_code = {ex.submit(fetch_yahoo, code): code for code in missing}
+            for f in concurrent.futures.as_completed(future_to_code):
+                code = future_to_code[f]
+                data = f.result()
+                if data is not None:
+                    results[code] = data
+        print(f"[info] ラウンド{round_no}終了: 累計 {len(results)}/{len(STOCKS)} 銘柄")
     return results
 
 
@@ -522,9 +554,10 @@ def main() -> int:
     got = len(prices)
     print(f"[info] 取得完了: {got}/{len(STOCKS)} 銘柄 ({elapsed:.1f}秒)")
 
-    if got < 50:
-        print(f"[error] 取得銘柄数が少なすぎる ({got}/{len(STOCKS)}) - スキップ", file=sys.stderr)
-        return 1
+    if got < MIN_GOT:
+        print(f"[error] 取得銘柄数が不足 ({got}/{len(STOCKS)}, 最低{MIN_GOT}必要) - 今回はスキップ", file=sys.stderr)
+        # 一時的な失敗でワークフロー全体を赤くしない (次の30分後の実行に期待)
+        return 0
 
     data = compute_rankings(prices)
     print(f"[info] ランキング計算完了 (時刻: {data['update_time']})")
