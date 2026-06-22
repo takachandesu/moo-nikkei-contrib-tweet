@@ -438,7 +438,7 @@ def _build(data: dict, top_n: int, include_pct: bool, include_ts: bool) -> str:
         lines.append(f"{i}. {fmt(s)}")
     lines.append("")
     lines.append("#日経平均 #日経225 #寄与度")
-    lines.append(PUBLIC_URL)
+    lines.append("ニュース詳細はプロフィールのリンクと固定ポストに。")  # URLなし=通常ポスト課金
     return "\n".join(lines)
 
 
