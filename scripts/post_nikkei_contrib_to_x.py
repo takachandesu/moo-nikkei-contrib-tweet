@@ -301,9 +301,19 @@ URL_RE = re.compile(r"https?://\S+")
 
 
 def weighted_len(s: str) -> int:
-    """X の文字カウント: URL=23(t.co短縮), CJK等=2, ASCII=1"""
+    """X の文字カウント (twitter-text v3 の規則に合わせる)
+    URL=23(t.co短縮) / U+0000〜U+10FF と一部の記号=1 / それ以外(日本語・絵文字など)=2
+    ※ 旧版は ASCII 以外をすべて2と数えていたため「¥」などを多めに数えていた"""
     counted = URL_RE.sub("X" * 23, s)
-    return sum(1 if ord(c) < 0x80 else 2 for c in counted)
+    total = 0
+    for c in counted:
+        cp = ord(c)
+        if (cp <= 0x10FF or 0x2000 <= cp <= 0x200D or 0x2010 <= cp <= 0x201F
+                or 0x2032 <= cp <= 0x2037):
+            total += 1
+        else:
+            total += 2
+    return total
 
 
 def fmt_yen_1dec(yen_value: float) -> str:
@@ -411,7 +421,8 @@ def compute_rankings(prices: dict[str, tuple[float, float]]) -> dict:
 # ============================================================
 #  ツイート組み立て
 # ============================================================
-def _build(data: dict, top_n: int, include_pct: bool, include_ts: bool) -> str:
+def _build(data: dict, top_n: int, include_pct: bool, include_ts: bool,
+           include_footer: bool = True) -> str:
     now = datetime.now(JST)
     date_str = f"{now.month}/{now.day}"
     if include_ts:
@@ -438,7 +449,8 @@ def _build(data: dict, top_n: int, include_pct: bool, include_ts: bool) -> str:
         lines.append(f"{i}. {fmt(s)}")
     lines.append("")
     lines.append("#日経平均 #日経225 #寄与度")
-    lines.append("ニュース詳細はプロフィールのリンクと固定ポストに。")  # URLなし=通常ポスト課金
+    if include_footer:
+        lines.append("ニュース詳細はプロフィールのリンクと固定ポストに。")  # URLなし=通常ポスト課金
     return "\n".join(lines)
 
 
@@ -453,15 +465,25 @@ def build_tweet(data: dict) -> str:
         (3, False, True),
         (3, False, False),
     ]
-    for top_n, pct, ts in candidates:
-        t = _build(data, top_n, pct, ts)
-        L = weighted_len(t)
-        if L <= TWEET_LIMIT:
-            print(f"[info] 採用: top_n={top_n} pct={pct} ts={ts} len={L}")
-            return t
-        else:
-            print(f"[info] スキップ: top_n={top_n} pct={pct} ts={ts} len={L} (上限超え)")
-    return _build(data, 3, False, False)
+    # ★ 2026/10/11 修正:
+    #   旧版は全候補が280を超えると「上限超えのまま」最後の形を返していたため、
+    #   数字の桁が多い日 (例: アドバンテ +¥163.2) に X から 403 Forbidden で拒否されていた。
+    #   → まず末尾の案内文ありで試し、だめなら案内文なしで同じ順に試す。
+    for footer in (True, False):
+        for top_n, pct, ts in candidates:
+            t = _build(data, top_n, pct, ts, include_footer=footer)
+            L = weighted_len(t)
+            if L <= TWEET_LIMIT:
+                print(f"[info] 採用: top_n={top_n} pct={pct} ts={ts} footer={footer} len={L}")
+                return t
+            else:
+                print(f"[info] スキップ: top_n={top_n} pct={pct} ts={ts} footer={footer} len={L} (上限超え)")
+    # それでも超える場合 (通常ありえない) は最短形を280以内に切り詰める
+    t = _build(data, 3, False, False, include_footer=False)
+    while weighted_len(t) > TWEET_LIMIT and "\n" in t:
+        t = t.rsplit("\n", 1)[0]
+    print(f"[warn] 最短形でも上限超えのため末尾を削りました len={weighted_len(t)}")
+    return t
 
 
 # ============================================================
